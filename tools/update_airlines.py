@@ -54,12 +54,33 @@ class OpenFlightsAirlines(object):
     self.of_icao = defaultdict(list)
 
   def load_all_airlines(self):
-    aldb.cursor.execute('SELECT * FROM airlines WHERE name != ""')
+    # Match preferably against active ('Y') and frequency (more flights good)
+    aldb.cursor.execute('SELECT * FROM airlines WHERE name != "" ORDER BY active DESC, frequency DESC')
     for row in aldb.cursor:
-      if row['iata'] == "":
-        row['iata'] = None
-      self.of_iata[row['iata']].append(row)
-      self.of_icao[row['icao']].append(row)
+      self.add_airline(row)
+
+  def add_airline(self, row):
+    if row['iata'] == "":
+      row['iata'] = None
+    self.of_iata[row['iata']].append(row)
+    self.of_icao[row['icao']].append(row)
+
+  def upsert_airline(self, alid):
+    aldb.write_cursor.execute('SELECT * FROM airlines WHERE alid = %s', [alid])
+    row = aldb.write_cursor.fetchall()[0]
+    if row['iata'] == "":
+      row['iata'] = None
+    found = False
+    for idx, val in enumerate(self.of_iata[row['iata']]):
+      if val['alid'] == alid:
+        self.of_iata[row['iata']][idx] = row
+        found = True
+    for idx, val in enumerate(self.of_icao[row['icao']]):
+      if val['alid'] == alid:
+        self.of_icao[row['icao']][idx] = row
+        found = True
+    if not found:
+      self.add_airline(row)
 
   def match(self, wp):
     icao, iata, callsign, country = wp['icao'], wp['iata'], wp['callsign'], wp['country']
@@ -84,35 +105,35 @@ class OpenFlightsAirlines(object):
           break
 
     # Round 2: Find potential duplicates
-    if match and 'iata' in match and match['iata']:
-      for airline in self.of_iata[match['iata']]:
-        if airline == match:
-          continue
-        # Different countries?  Not dupes.
-        if airline['country'] != match['country']:
-          continue
-        # If non-null ICAO codes same, guaranteed dupe; if different, not dupe
-        if airline['icao'] and match['icao']:
-          if airline['icao'] == match['icao']:
-            dupe = airline
-          else:
-            continue
-
-        # If non-null callsigns same, guaranteed dupe; if different, not dupe
-        if airline['callsign'] and match['callsign']:
-          if airline['callsign'].upper() == match['callsign'].upper():
-            dupe = airline
-          else:
-            continue
-
-        # Are names very similar?
-        if difflib.SequenceMatcher(None, airline['name'], match['name']).ratio() > 0.8:
-          dupe = airline
+    #if match and 'iata' in match and match['iata']:
+    #  for airline in self.of_iata[match['iata']]:
+    #    if airline == match:
+    #      continue
+    #    # Different countries?  Not dupes.
+    #    if airline['country'] != match['country']:
+    #      continue
+    #    # If non-null ICAO codes same, guaranteed dupe; if different, not dupe
+    #    if airline['icao'] and match['icao']:
+    #      if airline['icao'] == match['icao']:
+    #        dupe = airline
+    #      else:
+    #        continue
+    #
+    #    # If non-null callsigns same, guaranteed dupe; if different, not dupe
+    #    if airline['callsign'] and match['callsign']:
+    #      if airline['callsign'].upper() == match['callsign'].upper():
+    #        dupe = airline
+    #      else:
+    #        continue
+    #
+    #    # Are names very similar?
+    #    if difflib.SequenceMatcher(None, airline['name'], match['name']).ratio() > 0.8:
+    #      dupe = airline
 
     # If dupe is active and match is not, flip order!
-    if dupe and 'active' in dupe and dupe['active'] == 'Y' and 'active' in match and match['active'] == 'N':
-      dupe = match
-      match = airline
+    #if dupe and 'active' in dupe and dupe['active'] == 'Y' and 'active' in match and match['active'] == 'N':
+    #  dupe = match
+    #  match = airline
 
     return match, dupe
 
@@ -129,7 +150,7 @@ class OpenFlightsAirlines(object):
     fields = {}
     for field in ['name', 'callsign', 'icao', 'iata', 'source', 'country', 'country_code', 'start_year', 'end_year', 'duplicate']:
       if field in wp and wp[field] and wp[field] != of[field]:
-        if not of[field] or wp[field].upper() != of[field].upper():
+        if not of[field] or str(wp[field]).upper() != str(of[field]).upper():
           if field != 'name' or len(wp[field]) > 3:
             if reliable or not of[field]:
               fields[field] = wp[field]
@@ -139,6 +160,10 @@ class OpenFlightsAirlines(object):
       fields['active'] = 'N'
     return fields
 
+  def add_new(self, wp):
+    alid = AirlineDB.add_new(self.aldb, wp)
+    self.upsert_airline(alid)
+
   def update_from_src(self, of, wp, dupe):
     if dupe:
       self.aldb.deduplicate(of['alid'], dupe['alid'])
@@ -146,13 +171,14 @@ class OpenFlightsAirlines(object):
     fields = self.diff(of, wp)
     if fields:
       self.aldb.update_from_src(of['alid'], fields)
+      self.upsert_airline(of['alid'])
       return 1
     else:
       return 0
 
 class AirlineDB(database_connector.DatabaseConnector):
   def add_new(self, wp):
-    self.safe_execute(
+    return self.safe_execute(
       'INSERT INTO airlines(name,iata,icao,callsign,country,country_code,active,source) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',
       (wp['name'], wp['iata'], wp['icao'], wp['callsign'], wp['country'], wp['country_code'], wp['active'], wp['source']))
 
@@ -320,12 +346,12 @@ def process(airlines, ofa, aldb, stats):
         stats['deduped'] += 1
       stats['updated'] += ofa.update_from_src(of_airline, airline, dupe)
     else:
-      if airline['active'] == 'Y':
+      if airline['iata'] or airline['icao']:
         print("= NEW %s" % pp(airline))
-        aldb.add_new(airline)
+        ofa.add_new(airline)
         stats['added'] += 1
       else:
-        print(". DEFUNCT %s" % pp(airline))
+        print(". IGNORE %s" % pp(airline))
     stats['total'] += 1
 
 if __name__ == "__main__":
